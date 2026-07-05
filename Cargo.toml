@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Bidirectional, low-latency text bridge between OpenCode and the official claude CLI (stream-json). Moves text only; each tool keeps its own auth."
 license = "MIT"
-repository = "https://github.com/noroboto/gw-bridge"
+repository = "https://github.com/NoRoboto/gw-bridge"
+homepage = "https://github.com/NoRoboto/gw-bridge"
 readme = "README.md"
 keywords = ["claude", "bridge", "cli", "mcp", "opencode"]
 categories = ["command-line-utilities", "development-tools"]
@@ -34,3 +35,8 @@ tempfile = "3"
 [profile.release]
 lto = true
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
