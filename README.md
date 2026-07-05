@@ -90,7 +90,7 @@ model/effort, MCP server, layered routing + prompt templates, statusline.
 
 Next up:
 
-- [ ] Clean mid-turn interrupt (today it kills + resumes the turn)
+- [x] Clean mid-turn interrupt (stream-json `control_request`; falls back to kill+resume if not honored in 10s)
 - [ ] Reverse lane as a proper OpenCode plugin
 - [x] One-command install via cargo-dist (shell installer + npm package on each release; Homebrew formula generated, tap publishing pending)
 - [ ] **Phase 2:** Obsidian integration

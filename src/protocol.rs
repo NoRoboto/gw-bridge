@@ -53,8 +53,26 @@ pub fn parse_event(line: &str) -> Vec<String> {
             Some(t) => vec![json!({"ev":"delta","text":t}).to_string()],
             None => vec![],
         },
+        // Assumes interrupt is the only control_request the bridge ever sends; if another
+        // kind is added, correlate by request_id before mapping to `interrupted`.
+        "control_response" => {
+            let ok = v.get("response").and_then(|r| r.get("subtype")).and_then(|x| x.as_str())
+                == Some("success");
+            vec![json!({"ev":"interrupted","ok":ok}).to_string()]
+        }
         _ => vec![],
     }
+}
+
+/// Stdin line asking claude to cancel the in-flight turn without ending the session.
+/// Claude acks with a `control_response` and the aborted turn still emits its `result`.
+pub fn control_interrupt_line(request_id: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "interrupt" }
+    })
+    .to_string()
 }
 
 /// Concatenate every `text` content block of an assistant message.
@@ -132,6 +150,23 @@ mod tests {
         let wrapped = single(r#"{"type":"stream_event","event":{"delta":{"text":"b"}}}"#);
         assert_eq!(wrapped["ev"], "delta");
         assert_eq!(wrapped["text"], "b");
+    }
+
+    #[test]
+    fn parse_event_control_response_maps_to_interrupted() {
+        let ok = single(r#"{"type":"control_response","response":{"subtype":"success","request_id":"i1"}}"#);
+        assert_eq!(ok["ev"], "interrupted");
+        assert_eq!(ok["ok"], true);
+        let err = single(r#"{"type":"control_response","response":{"subtype":"error","request_id":"i1"}}"#);
+        assert_eq!(err["ok"], false);
+    }
+
+    #[test]
+    fn control_interrupt_line_round_trips() {
+        let v: Value = serde_json::from_str(&control_interrupt_line("gw-1")).unwrap();
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request_id"], "gw-1");
+        assert_eq!(v["request"]["subtype"], "interrupt");
     }
 
     #[test]

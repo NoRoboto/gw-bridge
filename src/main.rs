@@ -30,7 +30,7 @@ use gw_bridge::config::{
     effective_routing, home, read_partial_routing, routing_global_file, routing_project_file,
     routing_project_file_legacy, state_dir, write_partial_routing, LaneRoute, PartialRouting,
 };
-use gw_bridge::protocol::{lane_key, lane_of, parse_event};
+use gw_bridge::protocol::{control_interrupt_line, lane_key, lane_of, parse_event};
 use gw_bridge::sessions::{sessions_file, SessionStore};
 use gw_bridge::statusline::format_statusline;
 use gw_bridge::template::{
@@ -873,6 +873,9 @@ async fn manager(
         let mut turn_start = Instant::now();
         let mut last_activity = Instant::now();
         let mut last_hb = Instant::now();
+        // Set when a clean interrupt was sent; if claude doesn't end the turn by then, we
+        // fall back to the old kill+resume path.
+        let mut interrupt_deadline: Option<Instant> = None;
 
         loop {
             tokio::select! {
@@ -888,6 +891,7 @@ async fn manager(
                             }
                         } else if s.contains("\"ev\":\"result\"") {
                             in_flight = false;
+                            interrupt_deadline = None;
                             last_activity = Instant::now();
                             let mut st = status.lock().unwrap();
                             st.in_flight = false;
@@ -913,6 +917,7 @@ async fn manager(
                         }
                         if write_user(&mut stdin, &text).await.is_err() { break; }
                         in_flight = true;
+                        interrupt_deadline = None;
                         turn_start = Instant::now();
                         last_activity = Instant::now();
                         last_hb = Instant::now();
@@ -935,7 +940,20 @@ async fn manager(
                             "effort": cur_effort.clone().unwrap_or_default(),
                         }).to_string());
                     }
-                    Some(Ctl::Interrupt) => { let _ = child.start_kill(); break; }
+                    Some(Ctl::Interrupt) => {
+                        // Clean path: ask claude to cancel the turn in place; the aborted turn
+                        // still emits its `result`, which unblocks clients and clears in_flight.
+                        // Idle sessions have nothing to cancel — keep them alive. Repeated
+                        // interrupts don't re-arm the deadline, so a hung child still dies on time.
+                        if in_flight && interrupt_deadline.is_none() {
+                            if write_interrupt(&mut stdin).await.is_ok() {
+                                interrupt_deadline = Some(Instant::now() + Duration::from_secs(10));
+                            } else {
+                                let _ = child.start_kill();
+                                break;
+                            }
+                        }
+                    }
                     None => {
                         let _ = child.start_kill();
                         let _ = child.wait().await;
@@ -946,6 +964,13 @@ async fn manager(
                 _ = ticker.tick() => {
                     let now = Instant::now();
                     if in_flight {
+                        if let Some(dl) = interrupt_deadline {
+                            if now >= dl {
+                                let _ = tx.send(json!({"ev":"error","text":"clean interrupt not honored in time; killing turn"}).to_string());
+                                let _ = child.start_kill();
+                                break;
+                            }
+                        }
                         if let Some(to) = turn_timeout {
                             if now.duration_since(turn_start) >= to {
                                 let _ = tx.send(json!({"ev":"timeout","after_ms":to.as_millis() as u64}).to_string());
@@ -1058,6 +1083,14 @@ fn spawn_claude(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     c.spawn().context("could not spawn `claude` (is it on PATH?)")
+}
+
+/// Ask claude to cancel the in-flight turn in place (no kill, no resume).
+async fn write_interrupt(stdin: &mut tokio::process::ChildStdin) -> std::io::Result<()> {
+    let line = control_interrupt_line(&format!("gw-{}", uuid::Uuid::new_v4()));
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await
 }
 
 async fn write_user(stdin: &mut tokio::process::ChildStdin, text: &str) -> std::io::Result<()> {
