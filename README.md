@@ -30,11 +30,19 @@ Lanes are independent claude sessions per project, so a `brain` turn and a `veri
 **concurrently** without colliding. Sessions persist and resume — come back tomorrow and each
 project's brain still remembers the conversation.
 
+## Install
+
+```bash
+# Prebuilt binary (Linux x86_64/aarch64, macOS Intel/Apple Silicon)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/NoRoboto/gw-bridge/releases/latest/download/gw-bridge-installer.sh | sh
+
+# Or from source
+cargo build --release && install -m755 target/release/gw-bridge ~/.local/bin/
+```
+
 ## Quick start
 
 ```bash
-cargo build --release && install -m755 target/release/gw-bridge ~/.local/bin/
-
 gw-bridge serve                      # terminal A — the daemon
 gw-bridge send "does this API break the slice-1 contract?"   # terminal B — ask and stream
 gw-bridge init                       # install the escalation rule so workers know when to ask
@@ -84,5 +92,5 @@ Next up:
 
 - [ ] Clean mid-turn interrupt (today it kills + resumes the turn)
 - [ ] Reverse lane as a proper OpenCode plugin
-- [ ] One-command install via cargo-dist (installers, Homebrew, npm shim)
+- [x] One-command install via cargo-dist (shell installer + npm package on each release; Homebrew formula generated, tap publishing pending)
 - [ ] **Phase 2:** Obsidian integration
