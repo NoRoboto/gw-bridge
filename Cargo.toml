@@ -1,0 +1,36 @@
+[package]
+name = "gw-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Bidirectional, low-latency text bridge between OpenCode and the official claude CLI (stream-json). Moves text only; each tool keeps its own auth."
+license = "MIT"
+repository = "https://github.com/noroboto/gw-bridge"
+readme = "README.md"
+keywords = ["claude", "bridge", "cli", "mcp", "opencode"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.85"
+
+[lib]
+name = "gw_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gw-bridge"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "sync", "time"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+schemars = "1.0"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+rmcp = { version = "1.8.0", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

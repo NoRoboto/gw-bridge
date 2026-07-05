@@ -1,0 +1,14 @@
+# Rust
+/target
+
+# Local scratch / handoffs are kept; OS junk is not
+.DS_Store
+*.swp
+
+# Local-only working files (kept on disk, never committed)
+handoff-status.md
+CLAUDE.md
+.atl/
+.gw-bridge/
+.gw-bridge.json
+AGENTS.md

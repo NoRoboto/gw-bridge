@@ -1,0 +1,173 @@
+//! Wire-level translation: claude stream-json lines -> compact bridge events,
+//! plus the (project, lane) keying scheme shared by the daemon and the clients.
+
+use serde_json::{json, Value};
+
+/// Lane a client op targets: the `--lane` value if given, else `main`.
+pub fn lane_of(over: Option<String>) -> String {
+    over.filter(|s| !s.is_empty()).unwrap_or_else(|| "main".into())
+}
+
+/// Registry / sessions key for a (project, lane) pair. Lane `main` keeps the bare project key
+/// for backward compatibility; other lanes get their own namespaced key (and thus their own
+/// claude session, running concurrently and persisting independently).
+pub fn lane_key(project: &str, lane: &str) -> String {
+    if lane == "main" {
+        project.to_string()
+    } else {
+        format!("{project}\u{1f}{lane}")
+    }
+}
+
+/// Translate a raw claude stream-json line into the bridge's compact event(s).
+/// Non-JSON or unrecognized lines yield no events — never a panic.
+pub fn parse_event(line: &str) -> Vec<String> {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+        "system" if v.get("subtype").and_then(|x| x.as_str()) == Some("init") => {
+            vec![json!({
+                "ev": "init",
+                "session_id": v.get("session_id").and_then(|x| x.as_str()).unwrap_or(""),
+                "model": v.get("model").and_then(|x| x.as_str()).unwrap_or(""),
+            })
+            .to_string()]
+        }
+        "assistant" => {
+            let text = extract_text(v.get("message"));
+            if text.is_empty() {
+                vec![]
+            } else {
+                vec![json!({"ev":"final","text":text}).to_string()]
+            }
+        }
+        "result" => vec![json!({
+            "ev": "result",
+            "text": v.get("result").and_then(|x| x.as_str()).unwrap_or(""),
+            "is_error": v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false),
+        })
+        .to_string()],
+        "content_block_delta" | "stream_event" => match find_delta_text(&v) {
+            Some(t) => vec![json!({"ev":"delta","text":t}).to_string()],
+            None => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+/// Concatenate every `text` content block of an assistant message.
+pub fn extract_text(msg: Option<&Value>) -> String {
+    let mut out = String::new();
+    if let Some(arr) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+        for b in arr {
+            if b.get("type").and_then(|x| x.as_str()) == Some("text") {
+                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
+                    out.push_str(t);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Find streaming delta text in either the flat (`delta.text`) or the wrapped
+/// (`event.delta.text`) shape claude emits.
+pub fn find_delta_text(v: &Value) -> Option<String> {
+    if let Some(t) = v.get("delta").and_then(|d| d.get("text")).and_then(|x| x.as_str()) {
+        return Some(t.to_string());
+    }
+    if let Some(t) = v
+        .get("event")
+        .and_then(|e| e.get("delta"))
+        .and_then(|d| d.get("text"))
+        .and_then(|x| x.as_str())
+    {
+        return Some(t.to_string());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn single(line: &str) -> Value {
+        let evs = parse_event(line);
+        assert_eq!(evs.len(), 1, "expected exactly one event for {line}");
+        serde_json::from_str(&evs[0]).unwrap()
+    }
+
+    #[test]
+    fn parse_event_init() {
+        let ev = single(r#"{"type":"system","subtype":"init","session_id":"abc-123","model":"claude-opus"}"#);
+        assert_eq!(ev["ev"], "init");
+        assert_eq!(ev["session_id"], "abc-123");
+        assert_eq!(ev["model"], "claude-opus");
+    }
+
+    #[test]
+    fn parse_event_result_carries_error_flag() {
+        let ev = single(r#"{"type":"result","result":"done","is_error":true}"#);
+        assert_eq!(ev["ev"], "result");
+        assert_eq!(ev["text"], "done");
+        assert_eq!(ev["is_error"], true);
+    }
+
+    #[test]
+    fn parse_event_assistant_final_and_empty() {
+        let ev = single(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#);
+        assert_eq!(ev["ev"], "final");
+        assert_eq!(ev["text"], "hi");
+        // Assistant message with no text blocks emits nothing.
+        assert!(parse_event(r#"{"type":"assistant","message":{"content":[{"type":"tool_use"}]}}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_event_delta_both_shapes() {
+        let flat = single(r#"{"type":"content_block_delta","delta":{"text":"a"}}"#);
+        assert_eq!(flat["ev"], "delta");
+        assert_eq!(flat["text"], "a");
+        let wrapped = single(r#"{"type":"stream_event","event":{"delta":{"text":"b"}}}"#);
+        assert_eq!(wrapped["ev"], "delta");
+        assert_eq!(wrapped["text"], "b");
+    }
+
+    #[test]
+    fn parse_event_garbage_never_panics() {
+        for line in ["", "not json", "{", "42", r#""just a string""#, r#"{"type":"unknown"}"#, "\u{0}\u{1}"] {
+            assert!(parse_event(line).is_empty(), "garbage line {line:?} must yield no events");
+        }
+    }
+
+    #[test]
+    fn extract_text_concatenates_text_blocks_only() {
+        let msg: Value = serde_json::from_str(
+            r#"{"content":[{"type":"text","text":"one "},{"type":"tool_use","name":"x"},{"type":"text","text":"two"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_text(Some(&msg)), "one two");
+        assert_eq!(extract_text(None), "");
+    }
+
+    #[test]
+    fn lane_key_main_is_bare_and_lanes_do_not_collide() {
+        // Backward compat: lane `main` keeps the pre-lane bare project key.
+        assert_eq!(lane_key("/proj", "main"), "/proj");
+        // Other lanes are namespaced and mutually distinct.
+        let brain = lane_key("/proj", "brain");
+        let verify = lane_key("/proj", "verify");
+        assert_ne!(brain, lane_key("/proj", "main"));
+        assert_ne!(brain, verify);
+        // The unit-separator namespacing cannot collide with another project's main key.
+        assert_ne!(brain, lane_key("/proj-brain", "main"));
+    }
+
+    #[test]
+    fn lane_of_defaults_and_filters_empty() {
+        assert_eq!(lane_of(None), "main");
+        assert_eq!(lane_of(Some(String::new())), "main");
+        assert_eq!(lane_of(Some("verify".into())), "verify");
+    }
+}
