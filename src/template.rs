@@ -92,6 +92,7 @@ mod tests {
         RoutingCfg {
             brain: LaneRoute { model: "opus".into(), effort: "max".into() },
             verify: LaneRoute { model: "sonnet".into(), effort: "low".into() },
+            ..Default::default()
         }
     }
 

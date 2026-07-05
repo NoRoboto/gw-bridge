@@ -10,7 +10,7 @@
 //!   gw-bridge tap     — subscribe and print every bridge event (debug / live view)
 //!   gw-bridge interrupt — cancel the in-flight claude turn
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -28,9 +28,12 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use gw_bridge::config::{
     effective_routing, home, read_partial_routing, routing_global_file, routing_project_file,
-    routing_project_file_legacy, state_dir, write_partial_routing, LaneRoute, PartialRouting,
+    routing_project_file_legacy, state_dir, write_partial_routing, LaneRoute, WorkerRoute,
 };
-use gw_bridge::protocol::{control_interrupt_line, lane_key, lane_of, parse_event};
+use gw_bridge::protocol::{
+    control_interrupt_line, lane_key, lane_of, opencode_session_id, parse_event,
+    parse_opencode_event,
+};
 use gw_bridge::sessions::{sessions_file, SessionStore};
 use gw_bridge::statusline::format_statusline;
 use gw_bridge::template::{
@@ -125,15 +128,18 @@ enum Cmd {
     /// Show or change the per-lane model routing (built-in default < global file < project file).
     /// With no flags: print the effective routing for this project. With --lane: set values.
     Routing {
-        /// Lane to configure: `brain` or `verify`.
+        /// Lane to configure: `brain`, `verify`, or `worker`.
         #[arg(long)]
         lane: Option<String>,
-        /// Model alias for the lane (e.g. fable, opus, sonnet).
+        /// Model alias for the lane (e.g. fable, opus, sonnet; `provider/model` for worker).
         #[arg(long)]
         model: Option<String>,
-        /// Reasoning effort for the lane: low, medium, high, xhigh, max.
+        /// Reasoning effort for the lane: low, medium, high, xhigh, max. Not for `worker`.
         #[arg(long)]
         effort: Option<String>,
+        /// Agent name for the `worker` lane (headless opencode). Only valid with `--lane worker`.
+        #[arg(long)]
+        agent: Option<String>,
         /// Where to save: `project` (<dir>/.gw-bridge.json, default) or `global`
         /// (~/.config/gw-bridge/routing.json).
         #[arg(long)]
@@ -228,8 +234,8 @@ async fn main() -> Result<()> {
         Cmd::Doctor => doctor_cmd(),
         Cmd::Config { model, effort, project, lane } => config_cmd(model, effort, project, lane).await,
         Cmd::Mcp => mcp_serve().await,
-        Cmd::Routing { lane, model, effort, scope, dir, wizard, json } => {
-            routing_cmd(lane, model, effort, scope, dir, wizard, json)
+        Cmd::Routing { lane, model, effort, agent, scope, dir, wizard, json } => {
+            routing_cmd(lane, model, effort, agent, scope, dir, wizard, json)
         }
         Cmd::Prompts { init, scope, dir, force } => prompts_cmd(init, scope, dir, force),
     }
@@ -414,10 +420,12 @@ fn reapply_rule(scope: &str, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn routing_cmd(
     lane: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    agent: Option<String>,
     scope: Option<String>,
     dir: Option<String>,
     wizard: bool,
@@ -449,17 +457,21 @@ fn routing_cmd(
             effort: prompt_default("verify lane effort", &eff.verify.effort)?,
         };
         let file = if scope == "global" { routing_global_file() } else { routing_project_file(&dir) };
-        write_partial_routing(&file, &PartialRouting { brain: Some(brain), verify: Some(verify) })?;
+        // Preserve any worker entry already in the file — the wizard only asks about the claude lanes.
+        let mut part = read_partial_routing(&file);
+        part.brain = Some(brain);
+        part.verify = Some(verify);
+        write_partial_routing(&file, &part)?;
         println!("routing saved to {}", file.display());
         reapply_rule(&scope, &dir)?;
         return Ok(());
     }
 
-    // Set mode: any of --lane/--model/--effort present.
-    if lane.is_some() || model.is_some() || effort.is_some() {
-        let lane = lane.context("--lane brain|verify is required to set routing")?;
-        if lane != "brain" && lane != "verify" {
-            anyhow::bail!("invalid --lane: {lane} (use brain|verify)");
+    // Set mode: any of --lane/--model/--effort/--agent present.
+    if lane.is_some() || model.is_some() || effort.is_some() || agent.is_some() {
+        let lane = lane.context("--lane brain|verify|worker is required to set routing")?;
+        if lane != "brain" && lane != "verify" && lane != "worker" {
+            anyhow::bail!("invalid --lane: {lane} (use brain|verify|worker)");
         }
         let scope = scope.unwrap_or_else(|| "project".into());
         if scope != "project" && scope != "global" {
@@ -468,6 +480,27 @@ fn routing_cmd(
         let file = if scope == "global" { routing_global_file() } else { routing_project_file(&dir) };
         // Fill whatever the caller omitted from the currently effective values.
         let eff = effective_routing(Some(&dir));
+        if lane == "worker" {
+            // The worker lane routes by opencode's axes: model + agent (effort has no meaning).
+            if effort.is_some() {
+                anyhow::bail!("--effort does not apply to the worker lane (headless opencode)");
+            }
+            let cur = eff.worker;
+            let route = WorkerRoute {
+                model: model.unwrap_or(cur.model),
+                agent: agent.unwrap_or(cur.agent),
+            };
+            let mut part = read_partial_routing(&file);
+            part.worker = Some(route.clone());
+            write_partial_routing(&file, &part)?;
+            let shown = |s: &str| if s.is_empty() { "(opencode default)".to_string() } else { s.to_string() };
+            println!("routing[worker] = {} agent {} ({scope}: {})", shown(&route.model), shown(&route.agent), file.display());
+            reapply_rule(&scope, &dir)?;
+            return Ok(());
+        }
+        if agent.is_some() {
+            anyhow::bail!("--agent only applies to the worker lane");
+        }
         let cur = if lane == "brain" { eff.brain } else { eff.verify };
         let route = LaneRoute {
             model: model.unwrap_or(cur.model),
@@ -499,7 +532,11 @@ fn routing_cmd(
     let src = |lane: &str| -> &str {
         let p = read_partial_routing(&pf);
         let g = read_partial_routing(&gf);
-        let (pp, gg) = if lane == "brain" { (p.brain.is_some(), g.brain.is_some()) } else { (p.verify.is_some(), g.verify.is_some()) };
+        let (pp, gg) = match lane {
+            "brain" => (p.brain.is_some(), g.brain.is_some()),
+            "verify" => (p.verify.is_some(), g.verify.is_some()),
+            _ => (p.worker.is_some(), g.worker.is_some()),
+        };
         if pp {
             "project"
         } else if gg {
@@ -508,11 +545,13 @@ fn routing_cmd(
             "default"
         }
     };
+    let shown = |s: &str| if s.is_empty() { "(opencode default)".to_string() } else { s.to_string() };
     println!("effective routing for {}:", dir.display());
     println!("  brain  → {} @ {}  ({})", eff.brain.model, eff.brain.effort, src("brain"));
     println!("  verify → {} @ {}  ({})", eff.verify.model, eff.verify.effort, src("verify"));
+    println!("  worker → {} agent {}  ({})", shown(&eff.worker.model), shown(&eff.worker.agent), src("worker"));
     println!("layers: default < {} < {}", gf.display(), pf.display());
-    println!("change: `gw-bridge routing --wizard` or `gw-bridge routing --lane brain --model X --effort Y [--scope global]`");
+    println!("change: `gw-bridge routing --wizard` or `gw-bridge routing --lane brain --model X --effort Y [--scope global]` (worker: `--lane worker --model provider/model --agent A`)");
     Ok(())
 }
 
@@ -602,7 +641,13 @@ fn get_or_create_project(reg: &Registry, sessions: &SharedSessions, project: &st
     let lane = lane.to_string();
     let sessions = sessions.clone();
     tokio::spawn(async move {
-        if let Err(e) = manager(project, lane, asks_rx, ev_tx, status, sessions).await {
+        // Lane `worker` is the reverse direction: headless `opencode run` instead of claude.
+        let res = if lane == "worker" {
+            manager_opencode(project, lane, asks_rx, ev_tx, status, sessions).await
+        } else {
+            manager(project, lane, asks_rx, ev_tx, status, sessions).await
+        };
+        if let Err(e) = res {
             eprintln!("gw-bridge: manager exited: {e:#}");
         }
     });
@@ -1102,6 +1147,254 @@ async fn write_user(stdin: &mut tokio::process::ChildStdin, text: &str) -> std::
     stdin.write_all(line.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
     stdin.flush().await
+}
+
+/// Owns the `worker` lane — the reverse direction: a Claude brain delegates work DOWN to the
+/// cheap OpenCode worker. Each ask runs ONE headless `opencode run` turn (the child prints
+/// NDJSON events and exits — no persistent process, so no heartbeat or idle reclaim here).
+/// Session continuity comes from opencode's own `--session` flag: the id is captured from the
+/// first run's events, persisted, and reused on every later run.
+async fn manager_opencode(
+    project: String,
+    lane: String,
+    mut asks: mpsc::Receiver<Ctl>,
+    tx: broadcast::Sender<String>,
+    status: Arc<Mutex<StatusState>>,
+    sessions: SharedSessions,
+) -> Result<()> {
+    // Per (project, lane) session key — the worker lane persists and resumes like the others.
+    let session_key = lane_key(&project, &lane);
+    // Continue this lane's prior opencode conversation if one was persisted.
+    let mut sid: Option<String> = sessions.lock().unwrap().get(&session_key).cloned();
+    if let Some(s) = sid.clone() {
+        status.lock().unwrap().session_id = s;
+    }
+    // opencode scopes its sessions by working dir too — run the child IN the project dir.
+    let cwd: Option<String> = (!project.is_empty()).then(|| project.clone());
+
+    // Kill a run that outlives this budget (seconds; 0 disables). Same knob as the claude lanes.
+    let turn_timeout = env_dur("GW_TURN_TIMEOUT", 300);
+
+    // A per-ask or `config` model override is sticky and beats the routing config; effort has
+    // no meaning for opencode — it is accepted and ignored. Without an override, model/agent
+    // are resolved from the routing config PER RUN (not frozen at manager start), so a live
+    // `gw-bridge routing --lane worker …` change takes effect on the next ask.
+    let project_dir = (!project.is_empty()).then(|| PathBuf::from(&project));
+    let mut model_override: Option<String> = None;
+    {
+        // Mirror the currently configured model into the status snapshot before the first run.
+        let m = effective_routing(project_dir.as_deref()).worker.model;
+        if !m.is_empty() {
+            status.lock().unwrap().model = m;
+        }
+    }
+
+    // Asks that arrived while a run was in flight — served in order once it finishes.
+    let mut queued: VecDeque<(String, Option<String>)> = VecDeque::new();
+
+    loop {
+        // Take the next ask: drain the queue first, then wait on the channel.
+        let text = match queued.pop_front() {
+            Some((text, model)) => {
+                if model.is_some() {
+                    model_override = model;
+                }
+                text
+            }
+            None => match asks.recv().await {
+                Some(Ctl::Ask { text, model, effort: _ }) => {
+                    if model.is_some() {
+                        model_override = model;
+                    }
+                    text
+                }
+                Some(Ctl::Config { model, effort: _ }) => {
+                    if model.is_some() {
+                        model_override = model;
+                    }
+                    {
+                        let mut st = status.lock().unwrap();
+                        if let Some(m) = &model_override {
+                            st.model = m.clone();
+                        }
+                    }
+                    let _ = tx.send(json!({
+                        "ev": "config",
+                        "model": model_override.clone().unwrap_or_default(),
+                        "effort": "",
+                    }).to_string());
+                    continue;
+                }
+                Some(Ctl::Interrupt) => continue, // nothing in flight
+                None => return Ok(()),            // all clients gone
+            },
+        };
+
+        // Resolve this run's model/agent: the sticky override first, else the routing config
+        // (re-read per run). Empty string = don't pass the flag (opencode's own default).
+        let route = effective_routing(project_dir.as_deref()).worker;
+        let run_model = model_override.clone().or_else(|| Some(route.model).filter(|s| !s.is_empty()));
+        let run_agent = Some(route.agent).filter(|s| !s.is_empty());
+
+        {
+            let mut st = status.lock().unwrap();
+            if let Some(m) = &run_model {
+                st.model = m.clone();
+            }
+            st.in_flight = true;
+            st.last_activity = Some(Instant::now());
+        }
+
+        let mut child = match spawn_opencode(&text, sid.as_deref(), cwd.as_deref(), run_model.as_deref(), run_agent.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                // Don't let a spawn failure kill the lane — report it and wait for the next ask.
+                let _ = tx.send(json!({"ev":"error","text":format!("{e:#}")}).to_string());
+                status.lock().unwrap().in_flight = false;
+                continue;
+            }
+        };
+        let stdout = child.stdout.take().context("opencode without stdout")?;
+        let mut lines = BufReader::new(stdout).lines();
+
+        // Concatenated text parts of this run — becomes the `result` text.
+        let mut acc = String::new();
+        // Set when the run was cut short (interrupt/timeout) — flags the result as an error.
+        let mut cut_short = false;
+        // Whether this run passed `--session`, and whether it printed ANY stdout line —
+        // together they detect a stale persisted session id (see below).
+        let used_session = sid.is_some();
+        let mut saw_events = false;
+        let turn_start = Instant::now();
+        let mut ticker = interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                next = lines.next_line() => {
+                    let Ok(Some(line)) = next else { break }; // stdout closed: the run is over
+                    saw_events = true;
+                    // First sighting of the opencode session id: persist it for continuity.
+                    if sid.is_none() {
+                        if let Some(id) = opencode_session_id(&line) {
+                            sessions.lock().unwrap().insert(session_key.clone(), id.clone());
+                            status.lock().unwrap().session_id = id.clone();
+                            sid = Some(id);
+                        }
+                    }
+                    for ev in parse_opencode_event(&line) {
+                        // Track the text parts so the final `result` carries the whole answer.
+                        if let Ok(v) = serde_json::from_str::<Value>(&ev) {
+                            if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                                if !acc.is_empty() {
+                                    acc.push('\n');
+                                }
+                                acc.push_str(t);
+                            }
+                        }
+                        let _ = tx.send(ev);
+                    }
+                }
+                a = asks.recv() => match a {
+                    Some(Ctl::Ask { text, model, effort: _ }) => {
+                        // One run at a time: queue it and keep reading the current one.
+                        queued.push_back((text, model));
+                    }
+                    Some(Ctl::Config { model, effort: _ }) => {
+                        if model.is_some() {
+                            model_override = model;
+                        }
+                        {
+                            let mut st = status.lock().unwrap();
+                            if let Some(m) = &model_override {
+                                st.model = m.clone();
+                            }
+                        }
+                        let _ = tx.send(json!({
+                            "ev": "config",
+                            "model": model_override.clone().unwrap_or_default(),
+                            "effort": "",
+                        }).to_string());
+                    }
+                    Some(Ctl::Interrupt) => {
+                        // One-shot process: killing the run IS the clean interrupt. Also drop
+                        // the queued asks — an interrupt cancels the lane's pending work, and
+                        // a stale interrupt must not leak into the next queued run.
+                        queued.clear();
+                        let _ = child.start_kill();
+                        cut_short = true;
+                        break;
+                    }
+                    None => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Ok(());
+                    }
+                },
+                _ = ticker.tick() => {
+                    if let Some(to) = turn_timeout {
+                        if turn_start.elapsed() >= to {
+                            let _ = tx.send(json!({"ev":"timeout","after_ms":to.as_millis() as u64}).to_string());
+                            let _ = child.start_kill();
+                            cut_short = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = child.start_kill();
+        let exit = child.wait().await;
+        let ok = exit.map(|s| s.success()).unwrap_or(false);
+        // A run that passed `--session`, failed, and printed nothing points at a stale
+        // persisted id (opencode's storage was cleaned, or a leftover entry from another lane
+        // shape): drop it so the next ask starts a fresh session instead of failing forever.
+        if used_session && !ok && !saw_events && !cut_short {
+            sessions.lock().unwrap().remove(&session_key);
+            status.lock().unwrap().session_id = String::new();
+            sid = None;
+            let _ = tx.send(json!({"ev":"error","text":"worker session could not be continued; resetting — the next ask starts fresh"}).to_string());
+        }
+        let is_error = cut_short || !ok;
+        let _ = tx.send(json!({"ev":"result","text":acc,"is_error":is_error}).to_string());
+        {
+            let mut st = status.lock().unwrap();
+            st.in_flight = false;
+            st.last_activity = Some(Instant::now());
+        }
+    }
+}
+
+/// Spawn ONE headless `opencode run` turn: it prints NDJSON events on stdout and exits.
+/// `session` continues a prior conversation; `model`/`agent` are only passed when set
+/// (None = opencode's own defaults).
+fn spawn_opencode(
+    text: &str,
+    session: Option<&str>,
+    cwd: Option<&str>,
+    model: Option<&str>,
+    agent: Option<&str>,
+) -> Result<tokio::process::Child> {
+    let mut c = Command::new("opencode");
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    c.arg("run").arg("--format").arg("json");
+    if let Some(s) = session {
+        c.arg("--session").arg(s);
+    }
+    if let Some(m) = model {
+        c.arg("--model").arg(m);
+    }
+    if let Some(a) = agent {
+        c.arg("--agent").arg(a);
+    }
+    c.arg("--").arg(text);
+    c.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    c.spawn().context("could not spawn `opencode` (is it on PATH?)")
 }
 
 // ---------------------------------------------------------------------------

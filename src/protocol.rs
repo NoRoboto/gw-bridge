@@ -1,5 +1,6 @@
-//! Wire-level translation: claude stream-json lines -> compact bridge events,
-//! plus the (project, lane) keying scheme shared by the daemon and the clients.
+//! Wire-level translation: claude stream-json (and headless opencode NDJSON) lines ->
+//! compact bridge events, plus the (project, lane) keying scheme shared by the daemon
+//! and the clients.
 
 use serde_json::{json, Value};
 
@@ -107,6 +108,36 @@ pub fn find_delta_text(v: &Value) -> Option<String> {
     None
 }
 
+/// Translate a raw `opencode run --format json` NDJSON line into bridge event(s).
+/// Opencode emits whole completed text parts, and a turn may emit several — so each `text`
+/// event maps to a `delta` (clients treat `final` as an emit-once whole answer and would
+/// drop the later parts; deltas accumulate in order, and the manager's terminal `result`
+/// carries the full concatenation). Everything else — step markers, tool events, empty
+/// text, non-JSON — yields no events, never a panic.
+pub fn parse_opencode_event(line: &str) -> Vec<String> {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    if v.get("type").and_then(|x| x.as_str()) != Some("text") {
+        return vec![];
+    }
+    match v.get("part").and_then(|p| p.get("text")).and_then(|x| x.as_str()) {
+        Some(t) if !t.is_empty() => vec![json!({"ev":"delta","text":t}).to_string()],
+        _ => vec![],
+    }
+}
+
+/// Extract the opencode session id (`sessionID`) from any NDJSON event line, if present.
+/// The daemon captures it from a run's first events to continue the session via `--session`.
+pub fn opencode_session_id(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("sessionID")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +228,44 @@ mod tests {
         assert_ne!(brain, verify);
         // The unit-separator namespacing cannot collide with another project's main key.
         assert_ne!(brain, lane_key("/proj-brain", "main"));
+    }
+
+    #[test]
+    fn parse_opencode_event_text_part_becomes_delta() {
+        // Deltas, not finals: clients treat `final` as an emit-once whole answer, so a turn
+        // with several text parts would reach them truncated. Deltas accumulate in order.
+        let evs = parse_opencode_event(
+            r#"{"type":"text","timestamp":1751234567,"sessionID":"ses_abc","part":{"type":"text","text":"PONG","time":{"start":1,"end":2}}}"#,
+        );
+        assert_eq!(evs.len(), 1, "one text part maps to one delta event");
+        let ev: Value = serde_json::from_str(&evs[0]).unwrap();
+        assert_eq!(ev["ev"], "delta");
+        assert_eq!(ev["text"], "PONG");
+    }
+
+    #[test]
+    fn parse_opencode_event_ignores_everything_else() {
+        for line in [
+            r#"{"type":"step_start","timestamp":1751234567,"sessionID":"ses_abc","part":{}}"#,
+            r#"{"type":"step_finish","timestamp":1751234567,"sessionID":"ses_abc","part":{"type":"step-finish","reason":"stop","tokens":{},"cost":0}}"#,
+            r#"{"type":"text","part":{"type":"text"}}"#, // text event without a text payload
+            r#"{"type":"text","part":{"type":"text","text":""}}"#, // empty text part
+            "",
+            "not json",
+            "{",
+        ] {
+            assert!(parse_opencode_event(line).is_empty(), "line {line:?} must yield no events");
+        }
+    }
+
+    #[test]
+    fn opencode_session_id_from_any_event_shape() {
+        let step = r#"{"type":"step_start","timestamp":1751234567,"sessionID":"ses_123","part":{}}"#;
+        let text = r#"{"type":"text","sessionID":"ses_123","part":{"type":"text","text":"hi"}}"#;
+        assert_eq!(opencode_session_id(step).as_deref(), Some("ses_123"));
+        assert_eq!(opencode_session_id(text).as_deref(), Some("ses_123"));
+        assert!(opencode_session_id(r#"{"type":"text","part":{}}"#).is_none());
+        assert!(opencode_session_id("garbage").is_none());
     }
 
     #[test]

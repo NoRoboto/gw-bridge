@@ -45,6 +45,17 @@ impl SessionStore {
         }
     }
 
+    /// Drop a session id (e.g. a persisted id that can no longer be continued) and flush to
+    /// disk. Same best-effort persistence as [`SessionStore::insert`]; absent keys are a no-op.
+    pub fn remove(&mut self, key: &str) {
+        if self.map.remove(key).is_none() {
+            return;
+        }
+        if let Err(e) = self.save() {
+            eprintln!("gw-bridge: could not persist sessions to {}: {e}", self.path.display());
+        }
+    }
+
     /// Atomic flush: write a sibling temp file, then rename over the real one, so
     /// readers (and crashes) never observe a partially written file.
     pub fn save(&self) -> std::io::Result<()> {
@@ -83,6 +94,24 @@ mod tests {
         assert_eq!(raw.len(), 2);
         // No temp file left behind after the atomic rename.
         assert!(!dir.path().join("sessions.json.tmp").exists());
+    }
+
+    #[test]
+    fn remove_deletes_the_key_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+
+        let mut store = SessionStore::load(path.clone());
+        store.insert("/proj\u{1f}worker".into(), "ses_stale".into());
+        store.insert("/proj".into(), "sid-main".into());
+        store.remove("/proj\u{1f}worker");
+        assert!(store.get("/proj\u{1f}worker").is_none());
+
+        // The deletion reaches disk; other keys survive. Removing a missing key is a no-op.
+        let mut reloaded = SessionStore::load(path);
+        assert!(reloaded.get("/proj\u{1f}worker").is_none());
+        assert_eq!(reloaded.get("/proj"), Some(&"sid-main".to_string()));
+        reloaded.remove("/does-not-exist");
     }
 
     #[test]

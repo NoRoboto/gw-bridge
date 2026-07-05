@@ -48,6 +48,13 @@ Send one JSON object per line. **Every op may carry `"project": "<canonical dir>
 session — e.g. lane `brain` (Opus) and lane `verify` (Sonnet) run at the same time on one project
 without colliding. Reference clients take `--project` / `--lane`. Unknown ops are ignored.
 
+Lane `worker` runs in the **reverse direction**: it is backed by headless `opencode run` (one
+one-shot child per ask — spawned, streamed, reaped) instead of a persistent `claude` session, so a
+Claude brain can delegate work down to the cheap OpenCode worker. Its model/agent come from the
+routing config's `worker` entry (`{"model": "provider/model", "agent": "name"}`; an empty string
+means opencode's own default); `effort` is accepted and ignored. The opencode session id is
+captured from a run's events, persisted, and continued across asks via `--session`.
+
 | op          | fields                                              | effect |
 |-------------|-----------------------------------------------------|--------|
 | `ask`       | `text` (string, required); `model`, `effort` (opt.) | Send one user turn to Opus. `model`/`effort` are **sticky** — they persist until changed, and a *different* value transparently re-homes the session via `claude --resume` (history preserved). |
@@ -104,7 +111,7 @@ Every line the bridge emits is one JSON object with an `ev` field.
 | `gw-bridge tap`                           | Subscribe and print every raw event (NDJSON) — debug / live view. |
 | `gw-bridge init [--scope global\|project] [--dir D] [--check]` | Install the Opus-escalation rule. `--check` exits 0 if configured, 2 if not. |
 | `gw-bridge doctor`                        | Re-apply the escalation rule (e.g. after a global file gets clobbered). |
-| `gw-bridge routing [--json] [--wizard] [--lane brain\|verify --model M --effort E] [--scope project\|global] [--dir D]` | Show or change the per-lane model routing. Layered config: built-in default < `~/.config/gw-bridge/routing.json` < `<project>/.gw-bridge/routing.json`. Changes re-render the escalation block. |
+| `gw-bridge routing [--json] [--wizard] [--lane brain\|verify\|worker --model M --effort E --agent A] [--scope project\|global] [--dir D]` | Show or change the per-lane model routing. Layered config: built-in default < `~/.config/gw-bridge/routing.json` < `<project>/.gw-bridge/routing.json`. Changes re-render the escalation block. `--agent` (and no `--effort`) applies to the `worker` lane only. |
 
 ## 6. Environment knobs
 

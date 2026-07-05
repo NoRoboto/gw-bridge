@@ -78,6 +78,20 @@ For OpenCode there are also plain command files in `opencode/command/` (`/ask-cl
 
 Full socket contract (NDJSON ops and events) lives in **`INTERFACE.md`**.
 
+## Reverse lane (delegate down)
+
+The bridge also runs in the opposite direction: lane `worker` is backed by headless
+`opencode run` (one-shot per ask, session continued via `--session`), so a Claude brain can
+delegate implementation down to the cheap worker without leaving its session:
+
+```bash
+gw-bridge send --lane worker "add a --json flag to the stats subcommand; tests included"
+```
+
+Route it like any other lane: `gw-bridge routing --lane worker --model provider/model --agent build`
+(empty values fall back to opencode's own defaults). A Claude Code command file ships in
+`claude/command/delegate-worker.md`.
+
 ## Tuning
 
 Env knobs on `serve`, in seconds (`0` disables): `GW_TURN_TIMEOUT` (300), `GW_HEARTBEAT` (15),
@@ -91,6 +105,6 @@ model/effort, MCP server, layered routing + prompt templates, statusline.
 Next up:
 
 - [x] Clean mid-turn interrupt (stream-json `control_request`; falls back to kill+resume if not honored in 10s)
-- [ ] Reverse lane as a proper OpenCode plugin
+- [x] Reverse lane: `worker` lane backed by headless `opencode run` — the brain delegates down with `gw-bridge send --lane worker "task"`
 - [x] One-command install via cargo-dist (shell installer + npm package on each release; Homebrew formula generated, tap publishing pending)
 - [ ] **Phase 2:** Obsidian integration

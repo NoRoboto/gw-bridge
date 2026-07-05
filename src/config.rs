@@ -11,10 +11,23 @@ pub struct LaneRoute {
     pub effort: String,
 }
 
+/// The `worker` lane runs headless `opencode run`, so it routes by opencode's own axes:
+/// model (`provider/model`) and agent. An empty string means "don't pass the flag" — the
+/// worker then uses opencode's own defaults. Both empty is the built-in default.
+#[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerRoute {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub agent: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RoutingCfg {
     pub brain: LaneRoute,
     pub verify: LaneRoute,
+    #[serde(default)]
+    pub worker: WorkerRoute,
 }
 
 impl Default for RoutingCfg {
@@ -22,6 +35,7 @@ impl Default for RoutingCfg {
         Self {
             brain: LaneRoute { model: "fable".into(), effort: "high".into() },
             verify: LaneRoute { model: "sonnet".into(), effort: "high".into() },
+            worker: WorkerRoute::default(),
         }
     }
 }
@@ -33,6 +47,8 @@ pub struct PartialRouting {
     pub brain: Option<LaneRoute>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<LaneRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerRoute>,
 }
 
 pub fn home() -> PathBuf {
@@ -90,6 +106,9 @@ pub fn merge_routing(defaults: RoutingCfg, global: PartialRouting, project: Part
         if let Some(v) = layer.verify {
             r.verify = v;
         }
+        if let Some(w) = layer.worker {
+            r.worker = w;
+        }
     }
     r
 }
@@ -130,10 +149,12 @@ mod tests {
         let global = PartialRouting {
             brain: Some(route("g-brain", "low")),
             verify: Some(route("g-verify", "low")),
+            worker: None,
         };
         let project = PartialRouting {
             brain: Some(route("p-brain", "max")),
             verify: Some(route("p-verify", "max")),
+            worker: None,
         };
         let r = merge_routing(RoutingCfg::default(), global, project);
         assert_eq!(r.brain, route("p-brain", "max"));
@@ -143,16 +164,34 @@ mod tests {
     #[test]
     fn merge_lanes_fall_through_independently() {
         // Global sets only brain; project sets only verify. Each lane resolves on its own.
-        let global = PartialRouting { brain: Some(route("g-brain", "low")), verify: None };
-        let project = PartialRouting { brain: None, verify: Some(route("p-verify", "xhigh")) };
+        let global = PartialRouting { brain: Some(route("g-brain", "low")), verify: None, worker: None };
+        let project = PartialRouting { brain: None, verify: Some(route("p-verify", "xhigh")), worker: None };
         let r = merge_routing(RoutingCfg::default(), global, project);
         assert_eq!(r.brain, route("g-brain", "low"), "brain comes from the global layer");
         assert_eq!(r.verify, route("p-verify", "xhigh"), "verify comes from the project layer");
 
         // And the reverse: project sets only brain — verify falls through to the default.
-        let project_only_brain = PartialRouting { brain: Some(route("p-brain", "high")), verify: None };
+        let project_only_brain = PartialRouting { brain: Some(route("p-brain", "high")), verify: None, worker: None };
         let r = merge_routing(RoutingCfg::default(), PartialRouting::default(), project_only_brain);
         assert_eq!(r.brain, route("p-brain", "high"));
         assert_eq!(r.verify, RoutingCfg::default().verify, "verify falls through to the default");
+    }
+
+    #[test]
+    fn merge_worker_falls_through_like_the_other_lanes() {
+        let w = |model: &str, agent: &str| WorkerRoute { model: model.into(), agent: agent.into() };
+        // Built-in default: both empty = opencode's own defaults.
+        let r = merge_routing(RoutingCfg::default(), PartialRouting::default(), PartialRouting::default());
+        assert_eq!(r.worker, WorkerRoute::default());
+        // Global sets worker; a project file that leaves it unset inherits it.
+        let global = PartialRouting { worker: Some(w("zai/glm-4.7", "build")), ..Default::default() };
+        let r = merge_routing(RoutingCfg::default(), global.clone(), PartialRouting::default());
+        assert_eq!(r.worker, w("zai/glm-4.7", "build"));
+        // A project worker entry wins over the global one, without touching the claude lanes.
+        let project = PartialRouting { worker: Some(w("minimax/m3", "")), ..Default::default() };
+        let r = merge_routing(RoutingCfg::default(), global, project);
+        assert_eq!(r.worker, w("minimax/m3", ""));
+        assert_eq!(r.brain, RoutingCfg::default().brain);
+        assert_eq!(r.verify, RoutingCfg::default().verify);
     }
 }
