@@ -1259,8 +1259,11 @@ async fn manager_opencode(
 
         // Concatenated text parts of this run — becomes the `result` text.
         let mut acc = String::new();
-        // Set when the run was cut short (interrupt/timeout) — flags the result as an error.
-        let mut cut_short = false;
+        // Why the run was cut short, if it was. Tracked separately because they age the
+        // session differently: a turn-timeout on a silent resume means the session is stale
+        // (reset it), while a user interrupt says nothing about session health.
+        let mut interrupted = false;
+        let mut timed_out = false;
         // Whether this run passed `--session`, and whether it printed ANY stdout line —
         // together they detect a stale persisted session id (see below).
         let used_session = sid.is_some();
@@ -1273,16 +1276,20 @@ async fn manager_opencode(
             tokio::select! {
                 next = lines.next_line() => {
                     let Ok(Some(line)) = next else { break }; // stdout closed: the run is over
-                    saw_events = true;
-                    // First sighting of the opencode session id: persist it for continuity.
-                    if sid.is_none() {
-                        if let Some(id) = opencode_session_id(&line) {
+                    // Only lines that carry a session id or parse into a bridge event count as
+                    // session liveness — a stray banner/noise line before a hang must not mask
+                    // the stale-session reset below.
+                    if let Some(id) = opencode_session_id(&line) {
+                        saw_events = true;
+                        // First sighting of the opencode session id: persist it for continuity.
+                        if sid.is_none() {
                             sessions.lock().unwrap().insert(session_key.clone(), id.clone());
                             status.lock().unwrap().session_id = id.clone();
                             sid = Some(id);
                         }
                     }
                     for ev in parse_opencode_event(&line) {
+                        saw_events = true;
                         // Track the text parts so the final `result` carries the whole answer.
                         if let Ok(v) = serde_json::from_str::<Value>(&ev) {
                             if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
@@ -1322,7 +1329,7 @@ async fn manager_opencode(
                         // a stale interrupt must not leak into the next queued run.
                         queued.clear();
                         let _ = child.start_kill();
-                        cut_short = true;
+                        interrupted = true;
                         break;
                     }
                     None => {
@@ -1336,7 +1343,7 @@ async fn manager_opencode(
                         if turn_start.elapsed() >= to {
                             let _ = tx.send(json!({"ev":"timeout","after_ms":to.as_millis() as u64}).to_string());
                             let _ = child.start_kill();
-                            cut_short = true;
+                            timed_out = true;
                             break;
                         }
                     }
@@ -1347,16 +1354,18 @@ async fn manager_opencode(
         let _ = child.start_kill();
         let exit = child.wait().await;
         let ok = exit.map(|s| s.success()).unwrap_or(false);
-        // A run that passed `--session`, failed, and printed nothing points at a stale
-        // persisted id (opencode's storage was cleaned, or a leftover entry from another lane
-        // shape): drop it so the next ask starts a fresh session instead of failing forever.
-        if used_session && !ok && !saw_events && !cut_short {
+        // A run that passed `--session` and printed nothing before dying points at a stale
+        // persisted id — whether it exited with an error (opencode's storage was cleaned) or
+        // HUNG until the turn-timeout killed it (session from an older opencode version, seen
+        // after auto-updates). Drop it so the next ask starts fresh instead of failing forever.
+        // A user interrupt is excluded: killing a run early says nothing about session health.
+        if used_session && !ok && !saw_events && !interrupted {
             sessions.lock().unwrap().remove(&session_key);
             status.lock().unwrap().session_id = String::new();
             sid = None;
             let _ = tx.send(json!({"ev":"error","text":"worker session could not be continued; resetting — the next ask starts fresh"}).to_string());
         }
-        let is_error = cut_short || !ok;
+        let is_error = interrupted || timed_out || !ok;
         let _ = tx.send(json!({"ev":"result","text":acc,"is_error":is_error}).to_string());
         {
             let mut st = status.lock().unwrap();
