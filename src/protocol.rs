@@ -112,18 +112,30 @@ pub fn find_delta_text(v: &Value) -> Option<String> {
 /// Opencode emits whole completed text parts, and a turn may emit several — so each `text`
 /// event maps to a `delta` (clients treat `final` as an emit-once whole answer and would
 /// drop the later parts; deltas accumulate in order, and the manager's terminal `result`
-/// carries the full concatenation). Everything else — step markers, tool events, empty
-/// text, non-JSON — yields no events, never a panic.
+/// carries the full concatenation). `error` events map to the bridge's `error` event —
+/// opencode reports failures (e.g. provider TLS errors) this way and still exits 0, so
+/// swallowing them would surface as a silent empty result. Everything else — step markers,
+/// tool events, empty text, non-JSON — yields no events, never a panic.
 pub fn parse_opencode_event(line: &str) -> Vec<String> {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
-    if v.get("type").and_then(|x| x.as_str()) != Some("text") {
-        return vec![];
-    }
-    match v.get("part").and_then(|p| p.get("text")).and_then(|x| x.as_str()) {
-        Some(t) if !t.is_empty() => vec![json!({"ev":"delta","text":t}).to_string()],
+    match v.get("type").and_then(|x| x.as_str()) {
+        Some("text") => match v.get("part").and_then(|p| p.get("text")).and_then(|x| x.as_str()) {
+            Some(t) if !t.is_empty() => vec![json!({"ev":"delta","text":t}).to_string()],
+            _ => vec![],
+        },
+        Some("error") => {
+            let e = v.get("error");
+            let msg = e
+                .and_then(|e| e.get("data"))
+                .and_then(|d| d.get("message"))
+                .and_then(|x| x.as_str())
+                .or_else(|| e.and_then(|e| e.get("name")).and_then(|x| x.as_str()))
+                .unwrap_or("unknown opencode error");
+            vec![json!({"ev":"error","text":format!("opencode: {msg}")}).to_string()]
+        }
         _ => vec![],
     }
 }
@@ -241,6 +253,28 @@ mod tests {
         let ev: Value = serde_json::from_str(&evs[0]).unwrap();
         assert_eq!(ev["ev"], "delta");
         assert_eq!(ev["text"], "PONG");
+    }
+
+    #[test]
+    fn parse_opencode_event_error_maps_to_error_event() {
+        // Real shape observed from `opencode run --format json` on a provider TLS failure —
+        // note opencode still exits 0, so this event is the ONLY failure signal.
+        let evs = parse_opencode_event(
+            r#"{"type":"error","timestamp":1783455551146,"sessionID":"ses_abc","error":{"name":"UnknownError","data":{"message":"unknown certificate verification error"}}}"#,
+        );
+        assert_eq!(evs.len(), 1);
+        let ev: Value = serde_json::from_str(&evs[0]).unwrap();
+        assert_eq!(ev["ev"], "error");
+        assert_eq!(ev["text"], "opencode: unknown certificate verification error");
+        // Falls back to the error name, then to a fixed message.
+        let ev: Value = serde_json::from_str(
+            &parse_opencode_event(r#"{"type":"error","error":{"name":"ProviderAuthError"}}"#)[0],
+        )
+        .unwrap();
+        assert_eq!(ev["text"], "opencode: ProviderAuthError");
+        let ev: Value =
+            serde_json::from_str(&parse_opencode_event(r#"{"type":"error"}"#)[0]).unwrap();
+        assert_eq!(ev["text"], "opencode: unknown opencode error");
     }
 
     #[test]

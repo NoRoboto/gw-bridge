@@ -1264,6 +1264,9 @@ async fn manager_opencode(
         // (reset it), while a user interrupt says nothing about session health.
         let mut interrupted = false;
         let mut timed_out = false;
+        // Opencode reports failures as an `error` event and still exits 0 — track it so
+        // the terminal result is flagged as an error instead of a silent empty success.
+        let mut saw_error = false;
         // Whether this run passed `--session`, and whether it printed ANY stdout line —
         // together they detect a stale persisted session id (see below).
         let used_session = sid.is_some();
@@ -1290,9 +1293,12 @@ async fn manager_opencode(
                     }
                     for ev in parse_opencode_event(&line) {
                         saw_events = true;
-                        // Track the text parts so the final `result` carries the whole answer.
+                        // Track the text parts so the final `result` carries the whole answer;
+                        // error-event text is a diagnostic, not part of the answer.
                         if let Ok(v) = serde_json::from_str::<Value>(&ev) {
-                            if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                            if v.get("ev").and_then(|x| x.as_str()) == Some("error") {
+                                saw_error = true;
+                            } else if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
                                 if !acc.is_empty() {
                                     acc.push('\n');
                                 }
@@ -1365,7 +1371,7 @@ async fn manager_opencode(
             sid = None;
             let _ = tx.send(json!({"ev":"error","text":"worker session could not be continued; resetting — the next ask starts fresh"}).to_string());
         }
-        let is_error = interrupted || timed_out || !ok;
+        let is_error = interrupted || timed_out || saw_error || !ok;
         let _ = tx.send(json!({"ev":"result","text":acc,"is_error":is_error}).to_string());
         {
             let mut st = status.lock().unwrap();
@@ -1461,20 +1467,25 @@ async fn send_cmd(text: String, model: Option<String>, effort: Option<String>, p
                     }
                 }
                 println!();
+                // Failed turns must fail the command too — scripted callers rely on the
+                // exit status, and a silent 0 would pass an empty answer off as success.
+                if v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    std::process::exit(1);
+                }
                 break;
             }
             Some("timeout") => {
                 eprintln!("\n[gw-bridge: turn exceeded the timeout and was cancelled]");
-                break;
+                std::process::exit(1);
             }
             Some("session_ended") => {
                 eprintln!("\n[gw-bridge: claude session ended before the turn completed]");
-                break;
+                std::process::exit(1);
             }
             Some("error") => {
                 let msg = v.get("text").and_then(|x| x.as_str()).unwrap_or("unknown error");
                 eprintln!("\n[gw-bridge: {msg}]");
-                break;
+                std::process::exit(1);
             }
             _ => {} // heartbeat / init / idle_reclaim / model_switch: ignored by send
         }
